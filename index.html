@@ -1,1 +1,473 @@
+#!/usr/bin/env node
+/**
+ * ───────────────────────────────────────────────────────────────
+ *  webterm — керуй своїм комп'ютером із браузера.
+ *
+ *  Один файл: HTTP-сервер + WebSocket + вбудований фронтенд.
+ *
+ *  Запуск:    WEBTERM_PASSWORD=довгий-пароль node webterm.js
+ *  Відкрити:  http://127.0.0.1:7681
+ * ───────────────────────────────────────────────────────────────
+ */
 
+'use strict';
+
+const http = require('node:http');
+const os = require('node:os');
+const crypto = require('node:crypto');
+const { WebSocketServer } = require('ws');
+const pty = require('node-pty');
+
+/* ═════════════════════════ конфігурація ═════════════════════════ */
+
+const PORT = Number(process.env.PORT || 7681);
+const HOST = process.env.HOST || '127.0.0.1';       // назовні — тільки через VPN/проксі
+const PASSWORD = process.env.WEBTERM_PASSWORD || '';
+const SECURE_COOKIE = process.env.WEBTERM_HTTPS === '1';
+const SESSION_TTL = 8 * 60 * 60 * 1000;             // 8 годин
+const MAX_ATTEMPTS = 5;
+const LOCK_MS = 5 * 60 * 1000;
+
+const SHELL =
+  process.env.WEBTERM_SHELL ||
+  (process.platform === 'win32' ? 'powershell.exe' : process.env.SHELL || '/bin/bash');
+
+if (PASSWORD.length < 12) {
+  console.error('✖ WEBTERM_PASSWORD має бути щонайменше 12 символів.');
+  console.error('  Приклад: WEBTERM_PASSWORD=дужеДовгийПароль2026 node webterm.js');
+  process.exit(1);
+}
+
+/* ═════════════════════════ сесії / авторизація ═════════════════════════ */
+
+const sessions = new Map();   // sid -> expiresAt
+const attempts = new Map();   // ip  -> { count, lockedUntil }
+const passwordDigest = crypto.createHash('sha256').update(PASSWORD).digest();
+
+function passwordMatches(input) {
+  const digest = crypto.createHash('sha256').update(String(input || '')).digest();
+  return digest.length === passwordDigest.length && crypto.timingSafeEqual(digest, passwordDigest);
+}
+
+function isLocked(ip) {
+  const rec = attempts.get(ip);
+  return Boolean(rec && rec.lockedUntil > Date.now());
+}
+
+function noteFailure(ip) {
+  const rec = attempts.get(ip) || { count: 0, lockedUntil: 0 };
+  rec.count += 1;
+  if (rec.count >= MAX_ATTEMPTS) {
+    rec.count = 0;
+    rec.lockedUntil = Date.now() + LOCK_MS;
+  }
+  attempts.set(ip, rec);
+}
+
+function readCookie(req, name) {
+  const header = req.headers.cookie || '';
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    if (part.slice(0, idx).trim() === name) {
+      return decodeURIComponent(part.slice(idx + 1).trim());
+    }
+  }
+  return null;
+}
+
+function isAuthenticated(req) {
+  const sid = readCookie(req, 'webterm_sid');
+  if (!sid) return false;
+  const expiresAt = sessions.get(sid);
+  if (!expiresAt || expiresAt < Date.now()) {
+    sessions.delete(sid);
+    return false;
+  }
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, exp] of sessions) if (exp < now) sessions.delete(sid);
+  for (const [ip, rec] of attempts) {
+    if (rec.lockedUntil && rec.lockedUntil < now) attempts.delete(ip);
+  }
+}, 60_000).unref();
+
+/* ═════════════════════════ HTTP ═════════════════════════ */
+
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
+
+async function readJsonBody(req, limit = 4096) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error('payload_too_large');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+}
+
+const server = http.createServer(async (req, res) => {
+  const path = new URL(req.url, 'http://localhost').pathname;
+
+  try {
+    if (path === '/' && req.method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': [
+          "default-src 'none'",
+          "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+          "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+          "connect-src 'self' ws: wss:",
+          "img-src 'self' data:",
+          "font-src 'self' data:",
+        ].join('; '),
+      });
+      return res.end(HTML_PAGE);
+    }
+
+    if (path === '/api/session' && req.method === 'GET') {
+      return sendJson(res, 200, { authenticated: isAuthenticated(req) });
+    }
+
+    if (path === '/api/login' && req.method === 'POST') {
+      const ip = req.socket.remoteAddress || 'unknown';
+      if (isLocked(ip)) return sendJson(res, 429, { error: 'too_many_attempts' });
+
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        return sendJson(res, 400, { error: 'bad_request' });
+      }
+
+      if (!passwordMatches(body.password)) {
+        noteFailure(ip);
+        return sendJson(res, 401, { error: 'bad_credentials' });
+      }
+
+      attempts.delete(ip);
+      const sid = crypto.randomBytes(32).toString('base64url');
+      sessions.set(sid, Date.now() + SESSION_TTL);
+
+      const flags = [
+        'webterm_sid=' + sid,
+        'Path=/',
+        'HttpOnly',
+        'SameSite=Strict',
+        'Max-Age=' + Math.floor(SESSION_TTL / 1000),
+      ];
+      if (SECURE_COOKIE) flags.push('Secure');
+
+      res.setHeader('Set-Cookie', flags.join('; '));
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (path === '/api/logout' && req.method === 'POST') {
+      const sid = readCookie(req, 'webterm_sid');
+      if (sid) sessions.delete(sid);
+      res.setHeader('Set-Cookie', 'webterm_sid=; Path=/; HttpOnly; Max-Age=0');
+      return sendJson(res, 200, { ok: true });
+    }
+
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+  } catch (err) {
+    console.error('[http]', err);
+    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('internal error');
+  }
+});
+
+/* ═════════════════════════ WebSocket ═════════════════════════ */
+
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const path = new URL(req.url, 'http://localhost').pathname;
+
+  if (path !== '/ws' || !isAuthenticated(req)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+
+wss.on('connection', (ws) => {
+  const term = pty.spawn(SHELL, [], {
+    name: 'xterm-256color',
+    cols: 80,
+    rows: 24,
+    cwd: os.homedir(),
+    env: { ...process.env, TERM: 'xterm-256color' },
+  });
+
+  const send = (payload) => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
+  };
+
+  let alive = true;
+  const shutdown = () => {
+    if (!alive) return;
+    alive = false;
+    try { term.kill(); } catch { /* вже мертвий */ }
+  };
+
+  ws.on('close', shutdown);
+  ws.on('error', shutdown);
+
+  term.onData((data) => send({ type: 'output', data }));
+
+  term.onExit(({ exitCode }) => {
+    send({ type: 'exit', code: exitCode });
+    try { ws.close(); } catch { /* ignore */ }
+  });
+
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;                                  // сміття ігноруємо
+    }
+
+    if (msg.type === 'input' && typeof msg.data === 'string') {
+      term.write(msg.data);
+      return;
+    }
+
+    if (msg.type === 'resize') {
+      const cols = Math.max(2, Math.min(1000, Math.trunc(Number(msg.cols)) || 80));
+      const rows = Math.max(2, Math.min(1000, Math.trunc(Number(msg.rows)) || 24));
+      try { term.resize(cols, rows); } catch { /* ignore */ }
+    }
+  });
+});
+
+/* ═════════════════════════ вбудована сторінка ═════════════════════════ */
+
+const HTML_PAGE = `<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>webterm</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #14161a; color: #e6e6e6;
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  #terminal { flex: 1; min-height: 0; padding: 8px; }
+  #status {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 5px 12px; font-size: 12px;
+    background: #1d2027; color: #8b94a3;
+  }
+  #status.on  #status-text { color: #6dd58c; }
+  #status.off #status-text { color: #e07070; }
+  #logout {
+    background: none; border: 1px solid #2c313b; color: #8b94a3;
+    padding: 3px 10px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px;
+  }
+  #logout:hover { color: #e6e6e6; border-color: #4a5261; }
+  #login {
+    margin: auto; width: min(360px, 90vw); padding: 26px;
+    background: #1d2027; border: 1px solid #262b34; border-radius: 14px;
+  }
+  #login h1 { margin: 0 0 18px; font-size: 17px; font-weight: 600; }
+  #login p  { margin: 0 0 16px; font-size: 12px; color: #8b94a3; }
+  input, #login button {
+    width: 100%; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid #2c313b; background: #14161a; color: inherit; font: inherit;
+  }
+  input:focus { outline: 2px solid #2f6feb; outline-offset: 1px; }
+  #login button {
+    margin-top: 12px; background: #2f6feb; border-color: #2f6feb;
+    cursor: pointer; font-weight: 600;
+  }
+  #login button:hover { background: #3d7bf5; }
+  #error { color: #e07070; margin-top: 10px; min-height: 1.3em; font-size: 13px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<form id="login">
+  <h1>Доступ до термінала</h1>
+  <p>Ця машина віддає інтерактивний шел. Продовжуй лише якщо це твій комп'ютер.</p>
+  <input id="password" type="password" placeholder="Пароль"
+         autocomplete="current-password" autofocus required />
+  <button type="submit">Увійти</button>
+  <div id="error"></div>
+</form>
+
+<div id="terminal" hidden></div>
+
+<div id="status" hidden>
+  <span id="status-text">відключено</span>
+  <button id="logout" type="button" hidden>вийти</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script>
+(function () {
+  var loginForm  = document.getElementById('login');
+  var passwordEl = document.getElementById('password');
+  var errorBox   = document.getElementById('error');
+  var termHost   = document.getElementById('terminal');
+  var statusBar  = document.getElementById('status');
+  var statusText = document.getElementById('status-text');
+  var logoutBtn  = document.getElementById('logout');
+
+  var term = null, fit = null, socket = null, retryTimer = null;
+
+  function setStatus(text, kind) {
+    statusText.textContent = text;
+    statusBar.className = kind || '';
+  }
+
+  function send(payload) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(payload));
+    }
+  }
+
+  function buildTerminal() {
+    var FitCtor = (window.FitAddon && window.FitAddon.FitAddon) || window.FitAddon;
+
+    term = new window.Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      scrollback: 5000,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      theme: { background: '#14161a', foreground: '#e6e6e6', cursor: '#6dd58c' }
+    });
+
+    fit = new FitCtor();
+    term.loadAddon(fit);
+    term.open(termHost);
+    fit.fit();
+    term.focus();
+
+    term.onData(function (data) { send({ type: 'input', data: data }); });
+
+    var relayout = function () {
+      try {
+        fit.fit();
+        send({ type: 'resize', cols: term.cols, rows: term.rows });
+      } catch (e) { /* ignore */ }
+    };
+    window.addEventListener('resize', relayout);
+    if (window.ResizeObserver) new ResizeObserver(relayout).observe(termHost);
+  }
+
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    socket = new WebSocket(proto + '://' + location.host + '/ws');
+
+    socket.onopen = function () {
+      setStatus('підключено · ' + location.host, 'on');
+      send({ type: 'resize', cols: term.cols, rows: term.rows });
+      term.focus();
+    };
+
+    socket.onmessage = function (event) {
+      var msg = JSON.parse(event.data);
+      if (msg.type === 'output') term.write(msg.data);
+      if (msg.type === 'exit') {
+        term.write('\\r\\n[сесію завершено, код ' + msg.code + ']\\r\\n');
+        setStatus('сесію завершено', 'off');
+      }
+    };
+
+    socket.onclose = function () {
+      setStatus('відключено · перепідключення…', 'off');
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(connect, 1500);
+    };
+  }
+
+  function showTerminal() {
+    loginForm.hidden = true;
+    termHost.hidden = false;
+    statusBar.hidden = false;
+    logoutBtn.hidden = false;
+    if (!term) buildTerminal();
+    connect();
+  }
+
+  loginForm.addEventListener('submit', function (event) {
+    event.preventDefault();
+    errorBox.textContent = 'перевіряю…';
+
+    fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: passwordEl.value })
+    }).then(function (res) {
+      if (res.ok) { errorBox.textContent = ''; showTerminal(); return null; }
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        errorBox.textContent = body.error === 'too_many_attempts'
+          ? 'Забагато спроб. Зачекай кілька хвилин.'
+          : 'Невірний пароль.';
+      });
+    }).catch(function () {
+      errorBox.textContent = 'Сервер недоступний.';
+    });
+  });
+
+  logoutBtn.addEventListener('click', function () {
+    fetch('/api/logout', { method: 'POST' }).finally(function () { location.reload(); });
+  });
+
+  fetch('/api/session')
+    .then(function (r) { return r.json(); })
+    .then(function (data) { if (data.authenticated) showTerminal(); })
+    .catch(function () { /* перший запуск — показуємо логін */ });
+})();
+</script>
+</body>
+</html>`;
+
+/* ═════════════════════════ старт ═════════════════════════ */
+
+server.listen(PORT, HOST, () => {
+  console.log('');
+  console.log('  webterm запущено');
+  console.log('  →  http://' + HOST + ':' + PORT);
+  console.log('  шел: ' + SHELL);
+  console.log(HOST === '127.0.0.1'
+    ? '  (слухає тільки localhost — назовні через VPN або TLS-проксі)'
+    : '  ⚠  слухає ' + HOST + ' — переконайся, що порт закритий firewall-ом');
+  console.log('');
+});
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    console.log('\nзупиняюсь…');
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2000).unref();
+  });
+}
